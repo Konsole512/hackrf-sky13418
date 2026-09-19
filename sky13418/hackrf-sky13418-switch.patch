@@ -1,0 +1,354 @@
+diff --git a/firmware/common/operacake.c b/firmware/common/operacake.c
+index bce51b76..1666904b 100644
+--- a/firmware/common/operacake.c
++++ b/firmware/common/operacake.c
+@@ -32,6 +32,7 @@
+ #include "i2c_lpc.h"
+ #include "operacake_sctimer.h"
+ #include "platform_scu.h"
++#include "sky13418.h"
+ 
+ /*
+  * I2C Mode
+@@ -126,6 +127,28 @@ void operacake_write_reg(i2c_bus_t* const bus, uint8_t address, uint8_t reg, uin
+ 
+ uint8_t operacake_init(bool allow_gpio)
+ {
++#ifdef SKY13418_SWITCH
++	/*
++	 * No I2C expander on the SKY13418 board: skip the probe and expose a
++	 * single virtual board at address 0. The switch is driven only by the
++	 * SCT pins, so it is unusable if GPIO mode is not allowed (for example
++	 * when a PortaPack is fitted).
++	 */
++	for (int addr = 0; addr < OPERACAKE_MAX_BOARDS; addr++) {
++		operacake_boards[addr].present = false;
++		operacake_boards[addr].mode = MODE_MANUAL;
++		operacake_boards[addr].PA = OPERACAKE_PA1;
++		operacake_boards[addr].PB = OPERACAKE_PB1;
++	}
++	allow_gpio_mode = allow_gpio;
++	if (allow_gpio) {
++		operacake_sctimer_init();
++		operacake_boards[SKY13418_BOARD_ADDRESS].present = true;
++		operacake_boards[SKY13418_BOARD_ADDRESS].PA = SKY13418_PORT_DEFAULT;
++		operacake_boards[SKY13418_BOARD_ADDRESS].PB = OPERACAKE_PA1;
++	}
++	return 0;
++#else
+ 	/* Find connected operacakes */
+ 	for (int addr = 0; addr < 8; addr++) {
+ 		if (addr + OPERACAKE_ADDRESS_DEFAULT == skip_address) {
+@@ -153,6 +176,7 @@ uint8_t operacake_init(bool allow_gpio)
+ 		operacake_sctimer_init();
+ 	}
+ 	return 0;
++#endif
+ }
+ 
+ void operacake_skip_i2c_address(uint8_t address)
+@@ -215,7 +239,11 @@ uint8_t port_to_pins(uint8_t port)
+  */
+ uint8_t operacake_activate_ports(uint8_t address, uint8_t PA, uint8_t PB)
+ {
++#ifdef SKY13418_SWITCH
++	uint8_t side;
++#else
+ 	uint8_t side, pa, pb, reg;
++#endif
+ 	/* Ensure PA and PB are within the valid range. */
+ 	if ((PA > OPERACAKE_PB4) || (PB > OPERACAKE_PB4)) {
+ 		return 1;
+@@ -232,11 +260,21 @@ uint8_t operacake_activate_ports(uint8_t address, uint8_t PA, uint8_t PB)
+ 		side = OPERACAKE_SAMESIDE;
+ 	}
+ 
++#ifdef SKY13418_SWITCH
++	/* Only PA selects the SKY13418 port; PB is validated but ignored. */
++	(void) address;
++	(void) side;
++	if (!allow_gpio_mode) {
++		return 1;
++	}
++	operacake_sctimer_set_static_port(PA);
++#else
+ 	pa = port_to_pins(PA);
+ 	pb = port_to_pins(PB);
+ 
+ 	reg = (OPERACAKE_GPIO_DISABLE | side | pa | pb | OPERACAKE_EN_LEDS);
+ 	operacake_write_reg(oc_bus, address, OPERACAKE_REG_OUTPUT, reg);
++#endif
+ 	return 0;
+ }
+ 
+@@ -246,9 +284,27 @@ bool operacake_set_mode(uint8_t address, uint8_t mode)
+ 		return false;
+ 	}
+ 
++#ifdef SKY13418_SWITCH
++	if (!operacake_boards[address].present) {
++		return false;
++	}
++	if ((mode == MODE_TIME) && !allow_gpio_mode) {
++		return false;
++	}
++#endif
++
+ 	operacake_boards[address].mode = mode;
+ 	current_range = INVALID_RANGE;
+ 
++#ifdef SKY13418_SWITCH
++	if (mode != MODE_TIME) {
++		/* Hold the last manual port; frequency mode updates it on retune. */
++		operacake_activate_ports(
++			address,
++			operacake_boards[address].PA,
++			operacake_boards[address].PB);
++	}
++#else
+ 	if (mode == MODE_TIME) {
+ 		if (!allow_gpio_mode) {
+ 			return false;
+@@ -274,6 +330,7 @@ bool operacake_set_mode(uint8_t address, uint8_t mode)
+ 			operacake_boards[address].PA,
+ 			operacake_boards[address].PB);
+ 	}
++#endif
+ 
+ 	// If any boards are in MODE_TIME, enable the sctimer events.
+ 	bool enable_sctimer = false;
+@@ -404,6 +461,13 @@ uint16_t gpio_test(uint8_t address)
+ 	if (!allow_gpio_mode) {
+ 		return 0xFFFF;
+ 	}
++#ifdef SKY13418_SWITCH
++	/*
++	 * No I2C expander to read back, and the test would re-mux the SCT
++	 * pins as plain GPIO inputs. Report GPIO test as disabled.
++	 */
++	return 0xFFFF;
++#endif
+ 
+ 	const platform_scu_t* scu = platform_scu();
+ 
+diff --git a/firmware/common/operacake_sctimer.c b/firmware/common/operacake_sctimer.c
+index c5ec8a3b..7a4d19d3 100644
+--- a/firmware/common/operacake_sctimer.c
++++ b/firmware/common/operacake_sctimer.c
+@@ -30,6 +30,7 @@
+ #include "platform_detect.h"
+ #include "platform_scu.h"
+ #include "sct.h"
++#include "sky13418.h"
+ #ifdef IS_NOT_PRALINE
+ 	#include <libopencm3/cm3/common.h>
+ 	#include <libopencm3/lpc43xx/sgpio.h>
+@@ -48,6 +49,8 @@
+ 
+ static uint32_t default_output = 0;
+ 
++static uint32_t operacake_sctimer_port_to_output(uint8_t port);
++
+ /**
+  * Configure the SCTimer to rotate the antennas with the Operacake in phase with
+  * the sample clock. This will configure the SCTimer to output to the pins for
+@@ -78,6 +81,18 @@ void operacake_sctimer_init(void)
+ 	delay_us(1);
+ 
+ 	// Pin definitions for the HackRF
++#ifdef SKY13418_SWITCH
++	// SKY13418: only three control lines are used.
++	// V3 (bit 0)
++	scu_pinmux(scu->CTOUT_13, scu->CTOUT_PINCFG);
++	// V2 (bit 1)
++	scu_pinmux(scu->CTOUT_12, scu->CTOUT_PINCFG);
++	// V1 (bit 2): remapped from CTOUT_14 (P20 pin 5) to CTOUT_11 (P20 pin 11)
++	// after the pin 5 output driver was damaged (could source 3V3 but no
++	// longer sink to ground).
++	scu_pinmux(scu->CTOUT_11, scu->CTOUT_PINCFG);
++	// CTOUT_14 / CTOUT_8 (P20 pins 5 and 12) are left untouched.
++#else
+ 	// U2CTRL0
+ 	scu_pinmux(scu->CTOUT_13, scu->CTOUT_PINCFG);
+ 	// U2CTRL1
+@@ -88,6 +103,7 @@ void operacake_sctimer_init(void)
+ 	scu_pinmux(scu->CTOUT_8, scu->CTOUT_PINCFG);
+ 	// U1CTRL
+ 	scu_pinmux(scu->CTOUT_14, scu->CTOUT_PINCFG);
++#endif
+ 
+ 	uint8_t sct_clock_input;
+ #ifdef IS_NOT_PRALINE
+@@ -129,6 +145,12 @@ void operacake_sctimer_init(void)
+ 	// Default to state 0, events disabled
+ 	SCT_STATE = 0;
+ 
++#ifdef SKY13418_SWITCH
++	// Park the switch on the default (terminated) port until configured.
++	default_output = operacake_sctimer_port_to_output(SKY13418_PORT_DEFAULT);
++	SCT_OUTPUT = default_output;
++#endif
++
+ 	// Enable the SCTimer
+ 	SCT_CTRL &= ~SCT_CTRL_HALT_L(1);
+ }
+@@ -139,8 +161,14 @@ static uint32_t operacake_sctimer_port_to_output(uint8_t port)
+ 	int bit1 = (port >> 1) & 1;
+ 	int bit2 = (port >> 2) & 1;
+ 
++#ifdef SKY13418_SWITCH
++	// SKY13418: V3 = bit 0, V2 = bit 1, V1 = bit 2 (non-inverted).
++	// V1 remapped to CTOUT_11 (P20 pin 11); CTOUT_14 (pin 5) driver damaged.
++	return (bit0 << 13) | (bit1 << 12) | (bit2 << 11);
++#else
+ 	return (bit0 << 11) | (bit0 << 13) | (bit1 << 8) | (bit1 << 12) |
+ 		(((~bit2) & 1) << 14);
++#endif
+ }
+ 
+ void operacake_sctimer_enable(bool enable)
+@@ -193,12 +221,26 @@ void operacake_sctimer_set_dwell_times(struct operacake_dwell_times* times, int
+ 		bit1_set |= SCT_OUTn_SETm(bit1, i);
+ 		bit1_clr |= SCT_OUTn_CLRm(~bit1, i);
+ 
++#ifdef SKY13418_SWITCH
++		// SKY13418 V1 is active high.
++		bit2_set |= SCT_OUTn_SETm(bit2, i);
++		bit2_clr |= SCT_OUTn_CLRm(~bit2, i);
++#else
+ 		// (U1CTRL is inverted)
+ 		bit2_set |= SCT_OUTn_SETm(~bit2, i);
+ 		bit2_clr |= SCT_OUTn_CLRm(bit2, i);
++#endif
+ 	}
+ 
+ 	// Apply event set/clear mappings
++#ifdef SKY13418_SWITCH
++	U2CTRL0_SET = bit0_set; // V3 (CTOUT_13, P20 pin 9)
++	U2CTRL0_CLR = bit0_clr;
++	U2CTRL1_SET = bit1_set; // V2 (CTOUT_12, P20 pin 10)
++	U2CTRL1_CLR = bit1_clr;
++	U3CTRL0_SET = bit2_set; // V1 (CTOUT_11, P20 pin 11; remapped from pin 5)
++	U3CTRL0_CLR = bit2_clr;
++#else
+ 	U2CTRL0_SET = bit0_set;
+ 	U2CTRL0_CLR = bit0_clr;
+ 	U3CTRL0_SET = bit0_set;
+@@ -209,6 +251,7 @@ void operacake_sctimer_set_dwell_times(struct operacake_dwell_times* times, int
+ 	U3CTRL1_CLR = bit1_clr;
+ 	U1CTRL_SET = bit2_set;
+ 	U1CTRL_CLR = bit2_clr;
++#endif
+ 
+ 	// Set output pins to select the first port in the list
+ 	default_output = operacake_sctimer_port_to_output(times[0].port);
+@@ -244,3 +287,19 @@ void operacake_sctimer_reset_state(void)
+ 
+ 	SCT_CTRL &= ~SCT_CTRL_HALT_L(1);
+ }
++
++#ifdef SKY13418_SWITCH
++/**
++ * Hold the SKY13418 on a single port (manual and frequency modes).
++ * State 0 has no events enabled, so the outputs stay where they are put.
++ * The port also becomes the default restored by reset_state().
++ */
++void operacake_sctimer_set_static_port(uint8_t port)
++{
++	SCT_CTRL |= SCT_CTRL_HALT_L(1);
++	SCT_STATE = 0;
++	default_output = operacake_sctimer_port_to_output(port);
++	SCT_OUTPUT = default_output;
++	SCT_CTRL &= ~SCT_CTRL_HALT_L(1);
++}
++#endif
+diff --git a/firmware/common/operacake_sctimer.h b/firmware/common/operacake_sctimer.h
+index 04c86e92..7c2b1c44 100644
+--- a/firmware/common/operacake_sctimer.h
++++ b/firmware/common/operacake_sctimer.h
+@@ -36,3 +36,6 @@ void operacake_sctimer_enable(bool enable);
+ void operacake_sctimer_set_dwell_times(struct operacake_dwell_times* times, int n);
+ void operacake_sctimer_stop(void);
+ void operacake_sctimer_reset_state(void);
++#ifdef SKY13418_SWITCH
++void operacake_sctimer_set_static_port(uint8_t port);
++#endif
+diff --git a/firmware/common/sky13418.h b/firmware/common/sky13418.h
+new file mode 100644
+index 00000000..7bb284b7
+--- /dev/null
++++ b/firmware/common/sky13418.h
+@@ -0,0 +1,55 @@
++/*
++ * SKY13418-485LF SP8T switch support for HackRF (DF development).
++ *
++ * This file is part of HackRF.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2, or (at your option)
++ * any later version.
++ */
++
++#pragma once
++
++#ifdef SKY13418_SWITCH
++
++	#include "operacake.h"
++
++/*
++ * Wiring (P20 expansion header -> SKY13418 eval board):
++ *
++ *   P20 pin 9  GPIO3_12 / P7_4 / CTOUT_13  -> V3 (LSB)  via divider to ~1.8 V
++ *   P20 pin 10 GPIO3_13 / P7_5 / CTOUT_12  -> V2        via divider to ~1.8 V
++ *   P20 pin 5  GPIO3_8  / P7_0 / CTOUT_14  -> V1 (MSB)  via divider to ~1.8 V
++ *   P20 pin 3  3V3AUX                      -> VDD
++ *   P20 pin 13 GND                         -> GND
++ *
++ * SKY13418 control inputs are limited to +3.0 V absolute maximum, so the
++ * 3.3 V SCT outputs must be divided or level shifted.
++ *
++ * Opera Cake port index maps 1:1 onto the SKY13418 truth table:
++ *
++ *   port  host name  V1 V2 V3  SKY port  use
++ *   0     A1         0  0  0   RF1       North
++ *   1     A2         0  0  1   RF2       East
++ *   2     A3         0  1  0   RF3       South
++ *   3     A4         0  1  1   RF4       West
++ *   4     B1         1  0  0   RF5       50 ohm sync marker
++ *   5     B2         1  0  1   RF6       spare / calibration
++ *   6     B3         1  1  0   RF7       unused (terminate)
++ *   7     B4         1  1  1   RF8       unused (terminate)
++ */
++
++	/* The switch is presented to the host as Opera Cake address 0. */
++	#define SKY13418_BOARD_ADDRESS 0
++
++	#define SKY13418_PORT_NORTH  OPERACAKE_PA1
++	#define SKY13418_PORT_EAST   OPERACAKE_PA2
++	#define SKY13418_PORT_SOUTH  OPERACAKE_PA3
++	#define SKY13418_PORT_WEST   OPERACAKE_PA4
++	#define SKY13418_PORT_MARKER OPERACAKE_PB1
++
++	/* Port selected at boot and whenever no plan is configured. */
++	#define SKY13418_PORT_DEFAULT SKY13418_PORT_MARKER
++
++#endif /* SKY13418_SWITCH */
+diff --git a/firmware/hackrf-common.cmake b/firmware/hackrf-common.cmake
+index 8f6698da..47b586b4 100644
+--- a/firmware/hackrf-common.cmake
++++ b/firmware/hackrf-common.cmake
+@@ -88,6 +88,13 @@ endif()
+ 
+ SET(HACKRF_OPTS "-D${BOARD} -DLPC43XX -D${MCU_PARTNO} -DTX_ENABLE -D'VERSION_STRING=\"${VERSION}\"'")
+ 
++# Drive an external SKY13418 SP8T switch (V1/V2/V3) from the Opera Cake
++# time-mode SCT pins instead of an I2C-detected Opera Cake.
++option(SKY13418_SWITCH "Drive a SKY13418 SP8T switch from the Opera Cake SCT pins" OFF)
++if(SKY13418_SWITCH)
++	SET(HACKRF_OPTS "${HACKRF_OPTS} -DSKY13418_SWITCH")
++endif()
++
+ SET(LDSCRIPT_M4 "-T${PATH_HACKRF_FIRMWARE_COMMON}/${MCU_PARTNO}_M4_memory.ld -Tlibopencm3_lpc43xx_rom_to_ram.ld -T${PATH_HACKRF_FIRMWARE_COMMON}/LPC43xx_M4_M0_image_from_text.ld -T${PATH_HACKRF_FIRMWARE_COMMON}/LPC43xx_M4_memory_rom_only.ld")
+ 
+ SET(LDSCRIPT_M4_RAM "-T${PATH_HACKRF_FIRMWARE_COMMON}/${MCU_PARTNO}_M4_memory.ld -Tlibopencm3_lpc43xx.ld -T${PATH_HACKRF_FIRMWARE_COMMON}/LPC43xx_M4_M0_image_from_text.ld")

@@ -88,6 +88,13 @@ endif()
 
 SET(HACKRF_OPTS "-D${BOARD} -DLPC43XX -D${MCU_PARTNO} -DTX_ENABLE -D'VERSION_STRING=\"${VERSION}\"'")
 
+# Drive an external SKY13418 SP8T switch (V1/V2/V3) from the Opera Cake
+# time-mode SCT pins instead of an I2C-detected Opera Cake.
+option(SKY13418_SWITCH "Drive a SKY13418 SP8T switch from the Opera Cake SCT pins" OFF)
+if(SKY13418_SWITCH)
+	SET(HACKRF_OPTS "${HACKRF_OPTS} -DSKY13418_SWITCH")
+endif()
+
 SET(LDSCRIPT_M4 "-T${PATH_HACKRF_FIRMWARE_COMMON}/${MCU_PARTNO}_M4_memory.ld -Tlibopencm3_lpc43xx_rom_to_ram.ld -T${PATH_HACKRF_FIRMWARE_COMMON}/LPC43xx_M4_M0_image_from_text.ld -T${PATH_HACKRF_FIRMWARE_COMMON}/LPC43xx_M4_memory_rom_only.ld")
 
 SET(LDSCRIPT_M4_RAM "-T${PATH_HACKRF_FIRMWARE_COMMON}/${MCU_PARTNO}_M4_memory.ld -Tlibopencm3_lpc43xx.ld -T${PATH_HACKRF_FIRMWARE_COMMON}/LPC43xx_M4_M0_image_from_text.ld")

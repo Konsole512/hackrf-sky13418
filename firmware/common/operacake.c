@@ -32,6 +32,7 @@
 #include "i2c_lpc.h"
 #include "operacake_sctimer.h"
 #include "platform_scu.h"
+#include "sky13418.h"
 
 /*
  * I2C Mode
@@ -126,6 +127,28 @@ void operacake_write_reg(i2c_bus_t* const bus, uint8_t address, uint8_t reg, uin
 
 uint8_t operacake_init(bool allow_gpio)
 {
+#ifdef SKY13418_SWITCH
+	/*
+	 * No I2C expander on the SKY13418 board: skip the probe and expose a
+	 * single virtual board at address 0. The switch is driven only by the
+	 * SCT pins, so it is unusable if GPIO mode is not allowed (for example
+	 * when a PortaPack is fitted).
+	 */
+	for (int addr = 0; addr < OPERACAKE_MAX_BOARDS; addr++) {
+		operacake_boards[addr].present = false;
+		operacake_boards[addr].mode = MODE_MANUAL;
+		operacake_boards[addr].PA = OPERACAKE_PA1;
+		operacake_boards[addr].PB = OPERACAKE_PB1;
+	}
+	allow_gpio_mode = allow_gpio;
+	if (allow_gpio) {
+		operacake_sctimer_init();
+		operacake_boards[SKY13418_BOARD_ADDRESS].present = true;
+		operacake_boards[SKY13418_BOARD_ADDRESS].PA = SKY13418_PORT_DEFAULT;
+		operacake_boards[SKY13418_BOARD_ADDRESS].PB = OPERACAKE_PA1;
+	}
+	return 0;
+#else
 	/* Find connected operacakes */
 	for (int addr = 0; addr < 8; addr++) {
 		if (addr + OPERACAKE_ADDRESS_DEFAULT == skip_address) {
@@ -153,6 +176,7 @@ uint8_t operacake_init(bool allow_gpio)
 		operacake_sctimer_init();
 	}
 	return 0;
+#endif
 }
 
 void operacake_skip_i2c_address(uint8_t address)
@@ -215,7 +239,11 @@ uint8_t port_to_pins(uint8_t port)
  */
 uint8_t operacake_activate_ports(uint8_t address, uint8_t PA, uint8_t PB)
 {
+#ifdef SKY13418_SWITCH
+	uint8_t side;
+#else
 	uint8_t side, pa, pb, reg;
+#endif
 	/* Ensure PA and PB are within the valid range. */
 	if ((PA > OPERACAKE_PB4) || (PB > OPERACAKE_PB4)) {
 		return 1;
@@ -232,11 +260,21 @@ uint8_t operacake_activate_ports(uint8_t address, uint8_t PA, uint8_t PB)
 		side = OPERACAKE_SAMESIDE;
 	}
 
+#ifdef SKY13418_SWITCH
+	/* Only PA selects the SKY13418 port; PB is validated but ignored. */
+	(void) address;
+	(void) side;
+	if (!allow_gpio_mode) {
+		return 1;
+	}
+	operacake_sctimer_set_static_port(PA);
+#else
 	pa = port_to_pins(PA);
 	pb = port_to_pins(PB);
 
 	reg = (OPERACAKE_GPIO_DISABLE | side | pa | pb | OPERACAKE_EN_LEDS);
 	operacake_write_reg(oc_bus, address, OPERACAKE_REG_OUTPUT, reg);
+#endif
 	return 0;
 }
 
@@ -246,9 +284,27 @@ bool operacake_set_mode(uint8_t address, uint8_t mode)
 		return false;
 	}
 
+#ifdef SKY13418_SWITCH
+	if (!operacake_boards[address].present) {
+		return false;
+	}
+	if ((mode == MODE_TIME) && !allow_gpio_mode) {
+		return false;
+	}
+#endif
+
 	operacake_boards[address].mode = mode;
 	current_range = INVALID_RANGE;
 
+#ifdef SKY13418_SWITCH
+	if (mode != MODE_TIME) {
+		/* Hold the last manual port; frequency mode updates it on retune. */
+		operacake_activate_ports(
+			address,
+			operacake_boards[address].PA,
+			operacake_boards[address].PB);
+	}
+#else
 	if (mode == MODE_TIME) {
 		if (!allow_gpio_mode) {
 			return false;
@@ -274,6 +330,7 @@ bool operacake_set_mode(uint8_t address, uint8_t mode)
 			operacake_boards[address].PA,
 			operacake_boards[address].PB);
 	}
+#endif
 
 	// If any boards are in MODE_TIME, enable the sctimer events.
 	bool enable_sctimer = false;
@@ -404,6 +461,13 @@ uint16_t gpio_test(uint8_t address)
 	if (!allow_gpio_mode) {
 		return 0xFFFF;
 	}
+#ifdef SKY13418_SWITCH
+	/*
+	 * No I2C expander to read back, and the test would re-mux the SCT
+	 * pins as plain GPIO inputs. Report GPIO test as disabled.
+	 */
+	return 0xFFFF;
+#endif
 
 	const platform_scu_t* scu = platform_scu();
 

@@ -30,6 +30,7 @@
 #include "platform_detect.h"
 #include "platform_scu.h"
 #include "sct.h"
+#include "sky13418.h"
 #ifdef IS_NOT_PRALINE
 	#include <libopencm3/cm3/common.h>
 	#include <libopencm3/lpc43xx/sgpio.h>
@@ -47,6 +48,8 @@
 #define U3CTRL1_CLR SCT_OUT8_CLR
 
 static uint32_t default_output = 0;
+
+static uint32_t operacake_sctimer_port_to_output(uint8_t port);
 
 /**
  * Configure the SCTimer to rotate the antennas with the Operacake in phase with
@@ -78,6 +81,18 @@ void operacake_sctimer_init(void)
 	delay_us(1);
 
 	// Pin definitions for the HackRF
+#ifdef SKY13418_SWITCH
+	// SKY13418: only three control lines are used.
+	// V3 (bit 0)
+	scu_pinmux(scu->CTOUT_13, scu->CTOUT_PINCFG);
+	// V2 (bit 1)
+	scu_pinmux(scu->CTOUT_12, scu->CTOUT_PINCFG);
+	// V1 (bit 2): remapped from CTOUT_14 (P20 pin 5) to CTOUT_11 (P20 pin 11)
+	// after the pin 5 output driver was damaged (could source 3V3 but no
+	// longer sink to ground).
+	scu_pinmux(scu->CTOUT_11, scu->CTOUT_PINCFG);
+	// CTOUT_14 / CTOUT_8 (P20 pins 5 and 12) are left untouched.
+#else
 	// U2CTRL0
 	scu_pinmux(scu->CTOUT_13, scu->CTOUT_PINCFG);
 	// U2CTRL1
@@ -88,6 +103,7 @@ void operacake_sctimer_init(void)
 	scu_pinmux(scu->CTOUT_8, scu->CTOUT_PINCFG);
 	// U1CTRL
 	scu_pinmux(scu->CTOUT_14, scu->CTOUT_PINCFG);
+#endif
 
 	uint8_t sct_clock_input;
 #ifdef IS_NOT_PRALINE
@@ -129,6 +145,12 @@ void operacake_sctimer_init(void)
 	// Default to state 0, events disabled
 	SCT_STATE = 0;
 
+#ifdef SKY13418_SWITCH
+	// Park the switch on the default (terminated) port until configured.
+	default_output = operacake_sctimer_port_to_output(SKY13418_PORT_DEFAULT);
+	SCT_OUTPUT = default_output;
+#endif
+
 	// Enable the SCTimer
 	SCT_CTRL &= ~SCT_CTRL_HALT_L(1);
 }
@@ -139,8 +161,14 @@ static uint32_t operacake_sctimer_port_to_output(uint8_t port)
 	int bit1 = (port >> 1) & 1;
 	int bit2 = (port >> 2) & 1;
 
+#ifdef SKY13418_SWITCH
+	// SKY13418: V3 = bit 0, V2 = bit 1, V1 = bit 2 (non-inverted).
+	// V1 remapped to CTOUT_11 (P20 pin 11); CTOUT_14 (pin 5) driver damaged.
+	return (bit0 << 13) | (bit1 << 12) | (bit2 << 11);
+#else
 	return (bit0 << 11) | (bit0 << 13) | (bit1 << 8) | (bit1 << 12) |
 		(((~bit2) & 1) << 14);
+#endif
 }
 
 void operacake_sctimer_enable(bool enable)
@@ -193,12 +221,26 @@ void operacake_sctimer_set_dwell_times(struct operacake_dwell_times* times, int 
 		bit1_set |= SCT_OUTn_SETm(bit1, i);
 		bit1_clr |= SCT_OUTn_CLRm(~bit1, i);
 
+#ifdef SKY13418_SWITCH
+		// SKY13418 V1 is active high.
+		bit2_set |= SCT_OUTn_SETm(bit2, i);
+		bit2_clr |= SCT_OUTn_CLRm(~bit2, i);
+#else
 		// (U1CTRL is inverted)
 		bit2_set |= SCT_OUTn_SETm(~bit2, i);
 		bit2_clr |= SCT_OUTn_CLRm(bit2, i);
+#endif
 	}
 
 	// Apply event set/clear mappings
+#ifdef SKY13418_SWITCH
+	U2CTRL0_SET = bit0_set; // V3 (CTOUT_13, P20 pin 9)
+	U2CTRL0_CLR = bit0_clr;
+	U2CTRL1_SET = bit1_set; // V2 (CTOUT_12, P20 pin 10)
+	U2CTRL1_CLR = bit1_clr;
+	U3CTRL0_SET = bit2_set; // V1 (CTOUT_11, P20 pin 11; remapped from pin 5)
+	U3CTRL0_CLR = bit2_clr;
+#else
 	U2CTRL0_SET = bit0_set;
 	U2CTRL0_CLR = bit0_clr;
 	U3CTRL0_SET = bit0_set;
@@ -209,6 +251,7 @@ void operacake_sctimer_set_dwell_times(struct operacake_dwell_times* times, int 
 	U3CTRL1_CLR = bit1_clr;
 	U1CTRL_SET = bit2_set;
 	U1CTRL_CLR = bit2_clr;
+#endif
 
 	// Set output pins to select the first port in the list
 	default_output = operacake_sctimer_port_to_output(times[0].port);
@@ -244,3 +287,19 @@ void operacake_sctimer_reset_state(void)
 
 	SCT_CTRL &= ~SCT_CTRL_HALT_L(1);
 }
+
+#ifdef SKY13418_SWITCH
+/**
+ * Hold the SKY13418 on a single port (manual and frequency modes).
+ * State 0 has no events enabled, so the outputs stay where they are put.
+ * The port also becomes the default restored by reset_state().
+ */
+void operacake_sctimer_set_static_port(uint8_t port)
+{
+	SCT_CTRL |= SCT_CTRL_HALT_L(1);
+	SCT_STATE = 0;
+	default_output = operacake_sctimer_port_to_output(port);
+	SCT_OUTPUT = default_output;
+	SCT_CTRL &= ~SCT_CTRL_HALT_L(1);
+}
+#endif
