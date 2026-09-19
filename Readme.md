@@ -7,6 +7,8 @@ script that splits a switched-antenna capture into per-antenna dwells and
 estimates a bearing. 
 
 Note: Reason for using the BG7TBL specifically, over the Skyworks, is due to the BG7TBL having built-in resistors arranged as three divider pairs for V1-V3.
+<img width="632" height="813" alt="HackRF" src="https://github.com/user-attachments/assets/9add4b62-a080-4558-96af-ecca8403596e" />
+
 
 ## Contents
 
