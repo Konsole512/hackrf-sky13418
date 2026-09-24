@@ -134,13 +134,18 @@ The firmware cycles the switch through N, E, S, W and the marker in step with th
 sample clock. Set up the rotation, then stream a capture:
 
 ```bash
-# Dwell 20000 samples on each of N/E/S/W, 2000 on the 50-ohm marker
+# Dwell 20000 samples on each of N/E/S/W and on the 50-ohm marker
 hackrf_operacake -o 0 -m time \
-    -t A1:20000 -t A2:20000 -t A3:20000 -t A4:20000 -t B1:2000
+    -t A1:20000 -t A2:20000 -t A3:20000 -t A4:20000 -t B1:20000
 
 # Capture (time-mode rotation only advances while streaming)
 hackrf_transfer -r capture.iq -f 2440000000 -s 20000000
 ```
+**The marker dwell must be ≥ ~20000 samples (≈1 ms at 20 Msps).** The firmware's
+time-mode switch does not toggle for dwells shorter than about 1 ms, so a short
+marker (the earlier `2000`) never actually selects the 50 Ω port; the demux then
+finds no quiet notch, reports `weak marker contrast`, and decodes zero cycles.
+Keep the `-t B1:` value and `--marker` equal and ≥ 20000.
 
 Process the capture (needs `numpy`):
 
@@ -164,7 +169,7 @@ Useful flags (defaults match the capture command above):
 |------|---------|---------|
 | `--fs` | `20e6` | Sample rate (Hz) |
 | `--dwell` | `20000` | Samples per antenna (must match the `-t` args) |
-| `--marker` | `2000` | Samples on the marker port |
+| `--marker` | `20000` | Samples on the marker port |
 | `--settle` | auto | Samples dropped after each switch (default ≈5 µs) |
 | `--sync-cycles` | `20` | Cycles folded to find the marker |
 | `--no-resync` | off | Lock phase after the first sync |
@@ -192,6 +197,8 @@ uv run --with numpy python sky13418/sky_demux.py --selftest
   an open line to 0 V, so the switch reads that bit as permanently low.
 - **No sync / "weak marker contrast".** There must be a real signal present and
   the `--dwell`/`--marker` values must match the `hackrf_operacake -t` plan. The
-  rotation only runs while `hackrf_transfer` is streaming.
+  rotation only runs while `hackrf_transfer` is streaming. The most common cause
+  is too short a marker dwell: the firmware switch will not toggle for dwells
+  under ~1 ms (≈20000 samples), so keep `-t B1:` and `--marker` ≥ 20000.
 - **Rebuilding from scratch.** Re-apply the patch on a clean tree and repeat
   section 1. The firmware customization lives only in this patch, so keep it.
