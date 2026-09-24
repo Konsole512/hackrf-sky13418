@@ -6,7 +6,7 @@ Pairs with hackrf-sky13418-switch.patch. The firmware cycles the SKY13418
 through N, E, S, W and a 50-ohm marker port, in step with the sample clock:
 
     hackrf_operacake -o 0 -m time \
-        -t A1:20000 -t A2:20000 -t A3:20000 -t A4:20000 -t B1:2000
+        -t A1:20000 -t A2:20000 -t A3:20000 -t A4:20000 -t B1:20000
     hackrf_transfer -r capture.iq -f 2440000000 -s 20000000
 
 This script:
@@ -350,7 +350,7 @@ def simulate(sched: Schedule, cycles: int, bearing_deg: float, phase: int,
 
 
 def selftest() -> int:
-    sched = Schedule(dwell=20000, marker=2000)
+    sched = Schedule(dwell=20000, marker=20000)
     settle = default_settle(20e6)
     ok = True
     for bearing, phase in [(0, 0), (45, 500), (60, 12345), (90, 40000), (135, 81999),
@@ -382,7 +382,11 @@ def main() -> int:
     ap.add_argument("capture", nargs="?", help="hackrf_transfer int8 I/Q file")
     ap.add_argument("--fs", type=float, default=20e6, help="sample rate (Hz)")
     ap.add_argument("--dwell", type=int, default=20000, help="samples per antenna")
-    ap.add_argument("--marker", type=int, default=2000, help="samples on marker port")
+    # The firmware time-mode switch will not toggle for dwells shorter than
+    # ~1 ms (~20000 samples at 20 Msps); a shorter marker never selects the
+    # 50 ohm port, so the demux finds no quiet notch to sync on.
+    ap.add_argument("--marker", type=int, default=20000,
+                    help="samples on marker port (keep >= ~20000; see note above)")
     ap.add_argument("--settle", type=int, default=None,
                     help="samples dropped after each switch (default: auto)")
     ap.add_argument("--sync-cycles", type=int, default=20,
